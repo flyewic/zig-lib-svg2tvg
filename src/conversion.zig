@@ -328,6 +328,16 @@ const Rect = struct {
             try utils.auto_parse_def(@This(), self, Def, a, v);
         }
         if (self.width == null or self.height == null) return error.RectWithoutDimensions;
+        // SVG: when only one of `rx`/`ry` is given, the other defaults to it, and
+        // both are clamped to half the rectangle (a negative value is invalid and
+        // treated as auto). Without this, `rx`-only emits `elliptical_arc(rx, 0)`
+        // and the whole rectangle renders as nothing.
+        if (self.rx < 0) self.rx = 0;
+        if (self.ry < 0) self.ry = 0;
+        if (self.rx == 0 and self.ry > 0) self.rx = self.ry;
+        if (self.ry == 0 and self.rx > 0) self.ry = self.rx;
+        self.rx = @min(self.rx, self.width.? / 2);
+        self.ry = @min(self.ry, self.height.? / 2);
         const yline_len = @max(0, self.height.? - self.ry * 2);
         const xline_len = @max(0, self.width.? - self.rx * 2);
         var p = Point{
@@ -1388,3 +1398,43 @@ pub const make_node_debug = true and debug;
 pub const debug_write_path = false;
 pub const make_node_debug2 = false and debug;
 const debug = false;
+
+const testing_rect = std.testing;
+
+test "rect rx defaults ry to rx and vice versa" {
+    const a = testing_rect.allocator;
+    const tmpl = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 120 48\">{s}</svg>";
+    const only_rx = try std.fmt.allocPrint(a, tmpl, .{"<rect width=\"120\" height=\"48\" rx=\"8\" fill=\"#ffffff\"/>"});
+    defer a.free(only_rx);
+    const only_ry = try std.fmt.allocPrint(a, tmpl, .{"<rect width=\"120\" height=\"48\" ry=\"8\" fill=\"#ffffff\"/>"});
+    defer a.free(only_ry);
+    const both = try std.fmt.allocPrint(a, tmpl, .{"<rect width=\"120\" height=\"48\" rx=\"8\" ry=\"8\" fill=\"#ffffff\"/>"});
+    defer a.free(both);
+
+    const t_both = try tvg_from_svg(a, both, .{});
+    defer a.free(t_both);
+    const t_rx = try tvg_from_svg(a, only_rx, .{});
+    defer a.free(t_rx);
+    const t_ry = try tvg_from_svg(a, only_ry, .{});
+    defer a.free(t_ry);
+
+    // Both spellings must produce the identical TinyVG stream as the explicit
+    // `rx`+`ry` form; otherwise the round rect renders as nothing.
+    try testing_rect.expectEqualSlices(u8, t_both, t_rx);
+    try testing_rect.expectEqualSlices(u8, t_both, t_ry);
+}
+
+test "rect radii clamp to half the rectangle" {
+    const a = testing_rect.allocator;
+    const svg =
+        \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><rect width="20" height="10" rx="999" fill="#ffffff"/></svg>
+    ;
+    const clamped = try tvg_from_svg(a, svg, .{});
+    defer a.free(clamped);
+    const expect_svg =
+        \\<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 10"><rect width="20" height="10" rx="10" ry="5" fill="#ffffff"/></svg>
+    ;
+    const expect_tvg = try tvg_from_svg(a, expect_svg, .{});
+    defer a.free(expect_tvg);
+    try testing_rect.expectEqualSlices(u8, expect_tvg, clamped);
+}

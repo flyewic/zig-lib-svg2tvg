@@ -2104,8 +2104,7 @@ pub const Parser = struct {
     /// Prints the error to the supplied writer.
     pub fn fmtErr(self: *Parser, writer: anytype) !void {
         if (self.err) |e| {
-            try fmt.format(
-                writer,
+            try writer.print(
                 "at pos {d}: expected {s}, found ",
                 .{
                     if (e.pos.start < self.data.len) e.pos.start + 1 else self.data.len,
@@ -2113,9 +2112,9 @@ pub const Parser = struct {
                 },
             );
             if (e.pos.start < self.data.len) {
-                try fmt.format(writer, "'{s}'\n", .{self.data[e.pos.start .. e.pos.end + 1]});
+                try writer.print("'{s}'\n", .{self.data[e.pos.start .. e.pos.end + 1]});
             } else {
-                try fmt.format(writer, "end of data\n", .{});
+                try writer.print("end of data\n", .{});
             }
         }
     }
