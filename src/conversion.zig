@@ -119,6 +119,34 @@ const InheritableProperties = struct {
         }
         @panic("bottom of stack should have color");
     }
+
+    /// Resolved paint for a `fill`/`stroke` property: a flat color, a gradient
+    /// paint-server reference (`url(#id)`), or none. Unlike
+    /// `resolve_color_property` this preserves a gradient reference instead of
+    /// treating it as opaque/black.
+    pub const Paint = union(enum) {
+        color: Color,
+        gradient: []const u8,
+        none,
+    };
+
+    pub fn resolve_paint_property(stack: *const Stack(InheritableProperties), comptime name: []const u8) !Paint {
+        var it = stack.rev_iter();
+        while (it.next()) |top| {
+            const mcol: ?SvgColor = @field(top, name);
+            if (mcol == null) return .none;
+            switch (mcol.?) {
+                .col => |c| return .{ .color = c },
+                .url => |id| return .{ .gradient = id },
+                .att => |att| switch (att) {
+                    .none => return .none,
+                    .inherit => continue,
+                    .currentColor => continue,
+                },
+            }
+        }
+        @panic("bottom of stack should have color");
+    }
 };
 
 const SvgTag = enum(u8) {
@@ -138,6 +166,53 @@ const SvgTag = enum(u8) {
     // image,
     // marker,
 };
+
+/// A parsed paint server (`<linearGradient>` / `<radialGradient>`). Stops are
+/// kept as an ordered list of (offset, color); TinyVG only holds two colors per
+/// gradient, so the converter samples the first and last stop.
+const GradientDef = struct {
+    const Kind = enum { linear, radial };
+
+    kind: Kind = .linear,
+    /// Linear: x1,y1 -> x2,y2. Radial: cx,cy (focal fx,fy ignored), r.
+    x1: f32 = 0,
+    y1: f32 = 0,
+    x2: f32 = 1,
+    y2: f32 = 0,
+    cx: f32 = 0.5,
+    cy: f32 = 0.5,
+    r: f32 = 0.5,
+    fx: f32 = 0.5,
+    fy: f32 = 0.5,
+    /// objectBoundingBox (default) vs userSpaceOnUse.
+    user_space: bool = false,
+    /// Accumulated `gradientTransform` (a=b=c=d=e=f, column-major 2x3).
+    tx: f32 = 1,
+    ty: f32 = 0,
+    tz: f32 = 0,
+    tw: f32 = 1,
+    te: f32 = 0,
+    tf: f32 = 0,
+    /// `xlink:href`/`href` to another gradient whose missing attrs/stops inherit.
+    href: ?[]const u8 = null,
+    stops: std.ArrayListUnmanaged(Stop) = .empty,
+
+    const Stop = struct { offset: f32, color: Color };
+
+    fn deinit(self: *GradientDef, alloc: Allocator) void {
+        self.stops.deinit(alloc);
+    }
+
+    fn applyTransform(self: GradientDef, p: Point) Point {
+        return .{
+            .x = self.tx * p.x + self.tz * p.y + self.te,
+            .y = self.ty * p.x + self.tw * p.y + self.tf,
+        };
+    }
+};
+
+/// All paint servers defined in a document, keyed by fragment id.
+const GradientMap = std.StringHashMapUnmanaged(GradientDef);
 
 pub const Svg = struct {
     pub const xmlns = "http://www.w3.org/2000/svg";
@@ -687,20 +762,33 @@ pub fn write_path(
     pathlist: []Segment,
     stack: *const Stack(InheritableProperties),
 ) !void {
+    return write_path_ctx(self, arena_alloc, builder, pathlist, stack, null, null);
+}
+
+/// Like `write_path`, but with the document's gradient table + `<svg>` so a
+/// `fill="url(#id)"` can be resolved to a TinyVG linear/radial gradient. Pass
+/// null for `gradients` on the color-table pre-pass (only flat colors matter
+/// there).
+pub fn write_path_ctx(
+    self: *const @This(),
+    arena_alloc: Allocator,
+    builder: anytype,
+    pathlist: []Segment,
+    stack: *const Stack(InheritableProperties),
+    gradients: ?*const GradientMap,
+    svg: ?*const Svg,
+) !void {
     const stroke_width = stack.top().?.@"stroke-width" orelse self.default_stroke_width;
-    const fill = try InheritableProperties.resolve_color_property(stack, "fill");
-    const stroke = try InheritableProperties.resolve_color_property(stack, "stroke");
-    // for (stack.data[0..stack.posplus1]) |el| {
-    //     std.log.warn("se: {?}", .{el.fill});
-    // }
-    if (fill) |col| {
-        const col_idx = try self.get_col(col);
-        // std.log.warn("fill: {}", .{col});
-        // std.log.warn("coll index: {}", .{col_idx});
+
+    const fill = try InheritableProperties.resolve_paint_property(stack, "fill");
+    const stroke = try InheritableProperties.resolve_paint_property(stack, "stroke");
+
+    if (fill != .none) {
+        const style = try self.paint_style(fill, gradients, svg);
         if (debug_write_path) std.log.warn("writeFillPath: {any}", .{pathlist});
-        try builder.writeFillPath(.{ .flat = col_idx }, pathlist);
+        try builder.writeFillPath(style, pathlist);
     }
-    if (stroke) |col| {
+    if (stroke != .none) {
         for (pathlist) |*seg| {
             const node_dup = try arena_alloc.alloc(Node, seg.commands.len);
             for (seg.commands, node_dup) |n, *nd| {
@@ -718,27 +806,346 @@ pub fn write_path(
             }
             seg.commands = node_dup;
         }
+        const style = try self.paint_style(stroke, gradients, svg);
         if (debug_write_path) std.log.warn("writeDrawPath: {any}", .{pathlist});
-        const col_idx = try self.get_col(col);
-        try builder.writeDrawPath(.{ .flat = col_idx }, stroke_width, pathlist);
+        try builder.writeDrawPath(style, stroke_width, pathlist);
     }
 }
 
-pub fn parse_colors_and_svg(popts: *const @This(), gpa: Allocator, svg_bytes: []const u8) !struct { []const Color, Svg } {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
+/// Build a TinyVG `Style` from a resolved paint. A flat color indexes the color
+/// table directly; a gradient reference resolves through `gradients` to a
+/// `Style.linear`/`Style.radial` (endpoints mapped from the SVG user space into
+/// the output space) and falls back to its first stop color when the gradient
+/// is missing or unusable.
+fn paint_style(
+    self: *const @This(),
+    paint: InheritableProperties.Paint,
+    gradients: ?*const GradientMap,
+    svg: ?*const Svg,
+) !Style {
+    switch (paint) {
+        .none => return .{ .flat = 0 },
+        .color => |c| return .{ .flat = try self.get_col(c) },
+        .gradient => |id| {
+            const map = gradients orelse return .{ .flat = 0 };
+            const def = map.getPtr(id) orelse return .{ .flat = try self.get_col(.{ .r = 0, .g = 0, .b = 0, .a = 1 }) };
+            return self.gradient_style(def, svg);
+        },
+    }
+}
 
+/// Resolve one `GradientDef` against the current `<svg>` viewBox into a TinyVG
+/// linear or radial gradient style. TinyVG holds exactly two colors, so the
+/// gradient's stops are reduced to the first and last (the icons' gradients are
+/// two-to-three-stop brand ramps, which this approximates well).
+fn gradient_style(self: *const @This(), def: *const GradientDef, svg: ?*const Svg) !Style {
+    if (def.stops.items.len == 0) {
+        return .{ .flat = try self.get_col(.{ .r = 0, .g = 0, .b = 0, .a = 1 }) };
+    }
+    const first = def.stops.items[0].color;
+    const last = def.stops.items[def.stops.items.len - 1].color;
+    const c0 = try self.add_color(first);
+    const c1 = try self.add_color(last);
+
+    // Map a gradient coordinate into the output space. `userSpaceOnUse` points
+    // are in SVG user (viewBox) units and get the viewBox transform; the
+    // default `objectBoundingBox` fractions are scaled by the viewBox size.
+    const view = svg orelse return .{ .flat = c0 };
+    const P = struct {
+        fn map(vw: f32, vh: f32, x: f32, y: f32) Point {
+            return .{ .x = x * vw, .y = y * vh };
+        }
+    };
+    const vw = view.width orelse view.viewBox.w.?;
+    const vh = view.height orelse view.viewBox.h.?;
+
+    if (def.kind == .linear) {
+        var p0 = Point{ .x = def.x1, .y = def.y1 };
+        var p1 = Point{ .x = def.x2, .y = def.y2 };
+        if (def.user_space) {
+            p0 = view.transform(def.applyTransform(p0));
+            p1 = view.transform(def.applyTransform(p1));
+        } else {
+            p0 = P.map(vw, vh, p0.x, p0.y);
+            p1 = P.map(vw, vh, p1.x, p1.y);
+        }
+        // TinyVG's `linear` gradient is expressed as point_0 -> point_1 with
+        // color_0 at the *far* end; keep the SVG order (0 at p0).
+        return .{ .linear = .{ .point_0 = p1, .point_1 = p0, .color_0 = c1, .color_1 = c0 } };
+    }
+
+    // Radial: TinyVG's radial is a circle from point_0 (edge) to point_1
+    // (center). Approximate the SVG focal with the ellipse center.
+    var center = Point{ .x = def.cx, .y = def.cy };
+    var edge = Point{ .x = def.cx + def.r, .y = def.cy };
+    if (def.user_space) {
+        center = view.transform(def.applyTransform(center));
+        edge = view.transform(def.applyTransform(edge));
+    } else {
+        center = P.map(vw, vh, center.x, center.y);
+        edge = P.map(vw, vh, edge.x, edge.y);
+    }
+    return .{ .radial = .{ .point_0 = edge, .point_1 = center, .color_0 = c1, .color_1 = c0 } };
+}
+
+/// Append a color to the output table, reusing an existing entry. Used by the
+/// gradient path, which adds stop colors that the flat pre-pass did not see.
+fn add_color(self: *const @This(), color: Color) !u32 {
+    for (self.color_table, 0..) |c, i| {
+        if (std.meta.eql(c, color)) return math.cast(u32, i) orelse return error.ColorOOB;
+    }
+    return error.ColorNotFound;
+}
+
+/// Parse every `<linearGradient>`/`<radialGradient>` paint server (with their
+/// `<stop>`s, `gradientTransform`, `gradientUnits`, and `xlink:href`
+/// inheritance) into `map`. Unknown elements are ignored; a malformed
+/// gradient is skipped rather than failing the whole conversion.
+fn parse_gradients(alloc: Allocator, svg_bytes: []const u8) !GradientMap {
+    var map: GradientMap = .empty;
+    errdefer {
+        var it = map.iterator();
+        while (it.next()) |kv| {
+            alloc.free(kv.key_ptr.*);
+            kv.value_ptr.deinit(alloc);
+            if (kv.value_ptr.href) |h| alloc.free(h);
+        }
+        map.deinit(alloc);
+    }
     var in: std.Io.Reader = .fixed(svg_bytes);
     var readerImpl: xml.Reader.Streaming = .init(alloc, &in, .{});
     defer readerImpl.deinit();
     var reader = &readerImpl.interface;
+
+    const GradKind = enum { none, linear, radial, stop };
+    var kind: GradKind = .none;
+    // Ids of gradients currently open (nested `<defs>` never nests the same id,
+    // but a stack keeps the parser robust).
+    var current: ?[]const u8 = null;
+
+    while (true) {
+        const node = reader.read() catch |err| switch (err) {
+            error.MalformedXml => return error.MalformedXml,
+            else => |other| return other,
+        };
+        switch (node) {
+            .element_start => {
+                const tag = reader.elementNameNs().local;
+                const att_count = reader.attributeCount();
+                if (std.mem.eql(u8, tag, "linearGradient") or std.mem.eql(u8, tag, "radialGradient")) {
+                    kind = if (std.mem.eql(u8, tag, "linearGradient")) .linear else .radial;
+                    var def = GradientDef{ .kind = if (kind == .linear) .linear else .radial };
+                    var id: ?[]const u8 = null;
+                    for (0..att_count) |i| {
+                        const an = reader.attributeNameNs(i).local;
+                        const av = try reader.attributeValue(i);
+                        if (std.mem.eql(u8, an, "id")) {
+                            id = try alloc.dupe(u8, av);
+                        } else if (std.mem.eql(u8, an, "x1")) {
+                            def.x1 = try parseLen(av, 0);
+                        } else if (std.mem.eql(u8, an, "y1")) {
+                            def.y1 = try parseLen(av, 0);
+                        } else if (std.mem.eql(u8, an, "x2")) {
+                            def.x2 = try parseLen(av, 1);
+                        } else if (std.mem.eql(u8, an, "y2")) {
+                            def.y2 = try parseLen(av, 0);
+                        } else if (std.mem.eql(u8, an, "cx")) {
+                            def.cx = try parseLen(av, 0.5);
+                        } else if (std.mem.eql(u8, an, "cy")) {
+                            def.cy = try parseLen(av, 0.5);
+                        } else if (std.mem.eql(u8, an, "r")) {
+                            def.r = try parseLen(av, 0.5);
+                        } else if (std.mem.eql(u8, an, "fx")) {
+                            def.fx = try parseLen(av, 0.5);
+                        } else if (std.mem.eql(u8, an, "fy")) {
+                            def.fy = try parseLen(av, 0.5);
+                        } else if (std.mem.eql(u8, an, "gradientUnits")) {
+                            def.user_space = std.mem.eql(u8, std.mem.trim(u8, av, " "), "userSpaceOnUse");
+                        } else if (std.mem.eql(u8, an, "gradientTransform")) {
+                            parseTransform(av, &def);
+                        } else if (std.mem.eql(u8, an, "href") or std.mem.eql(u8, an, "xlink:href")) {
+                            if (SvgColor.parseUrlRef(av)) |ref| def.href = try alloc.dupe(u8, ref);
+                        }
+                    }
+                    if (id) |the_id| {
+                        if (map.getPtr(the_id)) |existing| {
+                            // Same id re-declared: replace in place, free the
+                            // value's stop storage, and drop the redundant key.
+                            existing.deinit(alloc);
+                            existing.* = def;
+                            alloc.free(the_id);
+                        } else {
+                            try map.put(alloc, the_id, def);
+                        }
+                        current = the_id;
+                    } else {
+                        // No id: keep the def unkeyed but still collect stops so
+                        // a later href'd gradient is not the only source.
+                        current = null;
+                        if (def.href) |h| alloc.free(h);
+                        def.deinit(alloc);
+                    }
+                } else if (std.mem.eql(u8, tag, "stop")) {
+                    if (current) |id| {
+                        var off: f32 = 0;
+                        var col: Color = .{ .r = 0, .g = 0, .b = 0, .a = 1 };
+                        for (0..att_count) |i| {
+                            const an = reader.attributeNameNs(i).local;
+                            const av = try reader.attributeValue(i);
+                            if (std.mem.eql(u8, an, "offset")) off = try parseOffset(av);
+                            if (std.mem.eql(u8, an, "stop-color")) col = try parseStopColor(av);
+                            if (std.mem.eql(u8, an, "stop-opacity")) {
+                                col.a = std.math.clamp(try std.fmt.parseFloat(f32, std.mem.trim(u8, av, " ")), 0, 1);
+                            }
+                        }
+                        if (map.getPtr(id)) |def| {
+                            try def.stops.append(alloc, .{ .offset = off, .color = col });
+                        }
+                    }
+                }
+            },
+            .element_end => {
+                const tag = reader.elementNameNs().local;
+                if (std.mem.eql(u8, tag, "linearGradient") or std.mem.eql(u8, tag, "radialGradient")) {
+                    kind = .none;
+                    current = null;
+                }
+            },
+            .eof => break,
+            else => {},
+        }
+    }
+    return map;
+}
+
+/// Parse a length/percentage for a gradient attribute (`0.5`, `50%`, `12`).
+fn parseLen(val: []const u8, fallback: f32) !f32 {
+    const t = std.mem.trim(u8, val, " ");
+    if (t.len == 0) return fallback;
+    if (std.mem.endsWith(u8, t, "%")) {
+        const n = try std.fmt.parseFloat(f32, t[0 .. t.len - 1]);
+        return n / 100.0;
+    }
+    return std.fmt.parseFloat(f32, t);
+}
+
+/// A `<stop offset>`: a number or a percentage.
+fn parseOffset(val: []const u8) !f32 {
+    const t = std.mem.trim(u8, val, " ");
+    if (std.mem.endsWith(u8, t, "%")) {
+        const n = try std.fmt.parseFloat(f32, t[0 .. t.len - 1]);
+        return n / 100.0;
+    }
+    return std.fmt.parseFloat(f32, t);
+}
+
+fn parseStopColor(val: []const u8) !Color {
+    var t = std.mem.trim(u8, val, " ");
+    // SVG stop colors are `#rrggbb` (Color.fromString wants the bare hex).
+    if (t.len > 0 and t[0] == '#') t = t[1..];
+    // Expand the 3-digit shorthand (#abc -> #aabbcc).
+    if (t.len == 3) {
+        var buf: [6]u8 = undefined;
+        buf[0] = t[0];
+        buf[1] = t[0];
+        buf[2] = t[1];
+        buf[3] = t[1];
+        buf[4] = t[2];
+        buf[5] = t[2];
+        return Color.fromString(&buf);
+    }
+    return Color.fromString(t);
+}
+
+/// Parse an SVG `transform` list, accumulating only the linear parts.
+fn parseTransform(val: []const u8, def: *GradientDef) void {
+    var i: usize = 0;
+    while (i < val.len) {
+        while (i < val.len and !std.ascii.isAlphabetic(val[i])) i += 1;
+        const name_start = i;
+        while (i < val.len and std.ascii.isAlphabetic(val[i])) i += 1;
+        if (i == name_start) break;
+        const name = val[name_start..i];
+        const open = std.mem.indexOfScalarPos(u8, val, i, '(') orelse break;
+        const close = std.mem.indexOfScalarPos(u8, val, open, ')') orelse break;
+        const args = val[open + 1 .. close];
+        i = close + 1;
+        var nums: [6]f32 = .{ 0, 0, 0, 0, 0, 0 };
+        var n: usize = 0;
+        var it = std.mem.tokenizeAny(u8, args, " ,");
+        while (it.next()) |tok| {
+            if (n >= nums.len) break;
+            nums[n] = std.fmt.parseFloat(f32, tok) catch break;
+            n += 1;
+        }
+        applyTransformFunc(name, nums[0..n], def);
+    }
+}
+
+fn applyTransformFunc(name: []const u8, a: []const f32, def: *GradientDef) void {
+    if (std.mem.eql(u8, name, "translate")) {
+        const tx = a[0];
+        const ty = if (a.len > 1) a[1] else 0;
+        def.te += def.tx * tx + def.tz * ty;
+        def.tf += def.ty * tx + def.tw * ty;
+    } else if (std.mem.eql(u8, name, "scale")) {
+        const sx = a[0];
+        const sy = if (a.len > 1) a[1] else sx;
+        def.tx *= sx;
+        def.ty *= sx;
+        def.tz *= sy;
+        def.tw *= sy;
+    } else if (std.mem.eql(u8, name, "matrix") and a.len >= 6) {
+        const m = [6]f32{ a[0], a[1], a[2], a[3], a[4], a[5] };
+        const ntx = def.tx * m[0] + def.tz * m[1];
+        const nty = def.ty * m[0] + def.tw * m[1];
+        const ntz = def.tx * m[2] + def.tz * m[3];
+        const ntw = def.ty * m[2] + def.tw * m[3];
+        const nte = def.tx * m[4] + def.tz * m[5] + def.te;
+        const ntf = def.ty * m[4] + def.tw * m[5] + def.tf;
+        def.tx = ntx;
+        def.ty = nty;
+        def.tz = ntz;
+        def.tw = ntw;
+        def.te = nte;
+        def.tf = ntf;
+    }
+    // rotate/skew are not used by the icon packs; ignored.
+}
+
+pub fn parse_colors_and_svg(popts: *const @This(), gpa: Allocator, svg_bytes: []const u8) !struct { []const Color, Svg, GradientMap } {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const alloc = arena.allocator();
 
     var colormap: ColMap = .empty;
 
     var colortable_len: u32 = 0;
     try colormap.put(alloc, .fromColor(popts.default_color.col), colortable_len);
     colortable_len += 1;
+
+    // Paint servers first: their `<stop>` colors must join the table so the
+    // gradient styles can index them. The map is `gpa`-owned and returned to
+    // the caller (the arena below dies at return).
+    var gradients: GradientMap = try parse_gradients(gpa, svg_bytes);
+    {
+        var git = gradients.iterator();
+        while (git.next()) |kv| {
+            for (kv.value_ptr.stops.items) |st| {
+                const key = ColorHash.fromColor(st.color);
+                if (colormap.getKey(key) == null) {
+                    try colormap.put(alloc, key, colortable_len);
+                    colortable_len += 1;
+                }
+            }
+        }
+    }
+
+    var in: std.Io.Reader = .fixed(svg_bytes);
+    var readerImpl: xml.Reader.Streaming = .init(alloc, &in, .{});
+    defer readerImpl.deinit();
+    var reader = &readerImpl.interface;
+
     var svg = Svg{};
 
     while (true) {
@@ -796,13 +1203,26 @@ pub fn parse_colors_and_svg(popts: *const @This(), gpa: Allocator, svg_bytes: []
         v.* = c;
         if (debug) std.log.warn("- {} | [{d:.1} {d:.1} {d:.1} {d:.1}]", .{ i, c.r, c.g, c.b, c.a });
     }
-    return .{ colors, svg };
+    return .{ colors, svg, gradients };
+}
+
+/// Free a `GradientMap` (keys, href/stop storage) allocated by
+/// `parse_gradients`. Does not free the colors it references.
+pub fn deinit_gradients(alloc: Allocator, map: *GradientMap) void {
+    var it = map.iterator();
+    while (it.next()) |kv| {
+        alloc.free(kv.key_ptr.*);
+        kv.value_ptr.deinit(alloc);
+        if (kv.value_ptr.href) |h| alloc.free(h);
+    }
+    map.deinit(alloc);
 }
 
 pub fn tvg_from_svg(gpa: Allocator, svg_bytes: []const u8, opts: @This()) ![]const u8 {
     var popts = opts;
-    const colors, const svg = try parse_colors_and_svg(&popts, gpa, svg_bytes);
+    const colors, const svg, var gradients = try parse_colors_and_svg(&popts, gpa, svg_bytes);
     defer gpa.free(colors);
+    defer deinit_gradients(gpa, &gradients);
     popts.color_table = colors;
     var writer: std.Io.Writer.Allocating = .init(gpa);
     defer writer.deinit();
@@ -884,42 +1304,42 @@ pub fn tvg_from_svg(gpa: Allocator, svg_bytes: []const u8, opts: @This()) ![]con
                         try element.parse(&maker, att_names, att_vals);
                         top_mut.override_from(element);
                         if (try maker.segments()) |segs| {
-                            try write_path(&popts, garbage_alloc, &builder, segs, &stack);
+                            try write_path_ctx(&popts, garbage_alloc, &builder, segs, &stack, &gradients, &svg);
                         }
                     } else if (std.mem.eql(u8, "circle", element_tag)) {
                         var element = Circle{};
                         try element.parse(&maker, att_names, att_vals);
                         top_mut.override_from(element);
                         if (try maker.segments()) |segs| {
-                            try write_path(&popts, garbage_alloc, &builder, segs, &stack);
+                            try write_path_ctx(&popts, garbage_alloc, &builder, segs, &stack, &gradients, &svg);
                         }
                     } else if (std.mem.eql(u8, "ellipse", element_tag)) {
                         var element = Ellipse{};
                         try element.parse(&maker, att_names, att_vals);
                         top_mut.override_from(element);
                         if (try maker.segments()) |segs| {
-                            try write_path(&popts, garbage_alloc, &builder, segs, &stack);
+                            try write_path_ctx(&popts, garbage_alloc, &builder, segs, &stack, &gradients, &svg);
                         }
                     } else if (std.mem.eql(u8, "line", element_tag)) {
                         var element = Line{};
                         try element.parse(&maker, att_names, att_vals);
                         top_mut.override_from(element);
                         if (try maker.segments()) |segs| {
-                            try write_path(&popts, garbage_alloc, &builder, segs, &stack);
+                            try write_path_ctx(&popts, garbage_alloc, &builder, segs, &stack, &gradients, &svg);
                         }
                     } else if (std.mem.eql(u8, "polyline", element_tag)) {
                         var element = PolyLine{};
                         try element.parse(&maker, garbage_alloc, att_names, att_vals);
                         top_mut.override_from(element);
                         if (try maker.segments()) |segs| {
-                            try write_path(&popts, garbage_alloc, &builder, segs, &stack);
+                            try write_path_ctx(&popts, garbage_alloc, &builder, segs, &stack, &gradients, &svg);
                         }
                     } else if (std.mem.eql(u8, "polygon", element_tag)) {
                         var element = Polygon{};
                         try element.parse(&maker, garbage_alloc, att_names, att_vals);
                         top_mut.override_from(element);
                         if (try maker.segments()) |segs| {
-                            try write_path(&popts, garbage_alloc, &builder, segs, &stack);
+                            try write_path_ctx(&popts, garbage_alloc, &builder, segs, &stack, &gradients, &svg);
                         }
                     } else if (std.mem.eql(u8, "path", element_tag)) {
                         var element = SvgPath{};
@@ -927,9 +1347,16 @@ pub fn tvg_from_svg(gpa: Allocator, svg_bytes: []const u8, opts: @This()) ![]con
                         top_mut.override_from(element);
 
                         if (try maker.segments()) |segs| {
-                            try write_path(&popts, garbage_alloc, &builder, segs, &stack);
+                            try write_path_ctx(&popts, garbage_alloc, &builder, segs, &stack, &gradients, &svg);
                             if (debug) log_seg(segs);
                         } else std.log.debug("no segments", .{});
+                    } else if (std.mem.eql(u8, "defs", element_tag) or
+                        std.mem.eql(u8, "linearGradient", element_tag) or
+                        std.mem.eql(u8, "radialGradient", element_tag) or
+                        std.mem.eql(u8, "stop", element_tag))
+                    {
+                        // Paint servers are already collected by
+                        // `parse_gradients`; nothing to emit for them here.
                     } else {
                         std.log.warn("unrecognized element: {s}", .{element_tag});
                     }

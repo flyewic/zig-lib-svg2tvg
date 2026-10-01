@@ -26,7 +26,7 @@
 //! partial SVG processing as per the spec.
 //!
 //! ```
-//! const io = @import("std").io;
+//! const io = @import("std").io; // unused (see io.fixedBufferStream below); 0.16 moved streams under std.Io
 //! const log = @import("std").log;
 //! const Path = @import("svg").Path;
 //! var path = try Path.parse(alloc, data);
@@ -51,11 +51,38 @@ const std = @import("std");
 const debug = @import("std").debug;
 const fmt = @import("std").fmt;
 const heap = @import("std").heap;
-const io = @import("std").io;
+const io = @import("std").io; // unused (see io.fixedBufferStream below); 0.16 moved streams under std.Io
 const log = @import("std").log;
 const math = @import("std").math;
 const mem = @import("std").mem;
 const testing = @import("std").testing;
+
+/// Zig 0.16 made `std.ArrayList` unmanaged. These parser helpers were written
+/// against the old managed API (`init(alloc)` + allocator-less methods); this
+/// shim keeps them readable without threading the allocator through every call.
+fn L(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const List = std.ArrayListUnmanaged(T);
+        list: List = .empty,
+        alloc: std.mem.Allocator,
+        pub fn init(a: std.mem.Allocator) Self {
+            return .{ .alloc = a };
+        }
+        pub fn append(self: *Self, item: T) std.mem.Allocator.Error!void {
+            try self.list.append(self.alloc, item);
+        }
+        pub fn appendSlice(self: *Self, slice: []const T) std.mem.Allocator.Error!void {
+            try self.list.appendSlice(self.alloc, slice);
+        }
+        pub fn deinit(self: *Self) void {
+            self.list.deinit(self.alloc);
+        }
+        pub fn toOwnedSlice(self: *Self) std.mem.Allocator.Error![]T {
+            return self.list.toOwnedSlice(self.alloc);
+        }
+    };
+}
 
 /// Path is an SVG path node representation.
 ///
@@ -100,7 +127,7 @@ pub const Path = struct {
     }
 
     fn _parse(self: *Path, parser: *Parser) !void {
-        var result = std.ArrayList(Node).init(self.arena.allocator());
+        var result = L(Node).init(self.arena.allocator());
         errdefer result.deinit();
 
         parser.consumeWhitespace();
@@ -181,7 +208,7 @@ pub const Path = struct {
             parser.consumeWhitespace();
         }
 
-        self.nodes = result.items;
+        self.nodes = result.list.items;
     }
 
     pub const NodeType = enum {
@@ -226,7 +253,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(CoordinatePair).init(alloc);
+            var args = L(CoordinatePair).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -271,7 +298,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -318,7 +345,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(CoordinatePair).init(alloc);
+            var args = L(CoordinatePair).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -363,7 +390,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -384,7 +411,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(Number).init(alloc);
+            var args = L(Number).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -427,7 +454,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -448,7 +475,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(Number).init(alloc);
+            var args = L(Number).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -491,7 +518,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -512,7 +539,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(CurveToArgument).init(alloc);
+            var args = L(CurveToArgument).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -557,7 +584,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -628,7 +655,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(SmoothCurveToArgument).init(alloc);
+            var args = L(SmoothCurveToArgument).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -673,7 +700,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -731,7 +758,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(QuadraticBezierCurveToArgument).init(alloc);
+            var args = L(QuadraticBezierCurveToArgument).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -776,7 +803,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -834,7 +861,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(CoordinatePair).init(alloc);
+            var args = L(CoordinatePair).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -879,7 +906,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -900,7 +927,7 @@ pub const Path = struct {
             var start = parser.pos;
             var relative: bool = undefined;
             var pos: Parser.Pos = undefined;
-            var args = std.ArrayList(EllipticalArcArgument).init(alloc);
+            var args = L(EllipticalArcArgument).init(alloc);
             errdefer args.deinit();
 
             switch (parser.data[parser.pos]) {
@@ -945,7 +972,7 @@ pub const Path = struct {
             parser.err = null;
             return .{
                 .relative = relative,
-                .args = args.items,
+                .args = args.list.items,
                 .pos = pos,
             };
         }
@@ -4331,8 +4358,8 @@ test "comsumeRParen" {
 /// For testing only.
 fn testError(p: *Parser, expected: [:0]const u8) !void {
     var buf = [_:0]u8{0} ** 256;
-    var stream = io.fixedBufferStream(&buf);
-    const writer = stream.writer();
+    var stream: std.Io.Writer = .fixed(&buf); // 0.16: fixed writer
+    const writer = &stream;
     try p.fmtErr(writer);
     try testing.expectEqualSentinel(
         u8,

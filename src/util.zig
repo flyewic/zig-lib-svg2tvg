@@ -463,8 +463,10 @@ pub const ColorHash = struct {
         };
     }
     pub fn get_hash_key(self: *const SvgColor) ?ColorHash {
-        if (self.* == .att) return null;
-        return ColorHash.fromColor(self.col);
+        return switch (self.*) {
+            .col => |c| ColorHash.fromColor(c),
+            .att, .url => null,
+        };
     }
 };
 

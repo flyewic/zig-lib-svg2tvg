@@ -128,12 +128,17 @@ pub const Color = root.tvg.Color;
 pub const SvgColorTag = enum {
     att,
     col,
+    /// A paint-server reference, `url(#id)` (a gradient). `val` is the id
+    /// without the `url(#` prefix / `)` suffix; the converter resolves it
+    /// against its gradient table.
+    url,
 };
 /// TODO: Svg Color inheritance handling of overriding values inside containers
 /// (Stack) -> Color Resolving
 pub const SvgColor = union(SvgColorTag) {
     att: SvgColorAttribute,
     col: Color,
+    url: []const u8,
     pub const none: SvgColor = .{ .att = .none };
     pub const inherit: SvgColor = .{ .att = .inherit };
     pub const currentColor: SvgColor = .{ .att = .currentColor };
@@ -149,11 +154,31 @@ pub const SvgColor = union(SvgColorTag) {
         if (std.mem.eql(u8, trimmed, "currentColor")) {
             return currentColor;
         }
+        // `url(#id)` paint server (gradient). Capture the id; resolution is
+        // deferred to the converter, which owns the gradient table.
+        if (parseUrlRef(trimmed)) |id| {
+            return .{ .url = id };
+        }
         const parsed = svg_parsing.Color.parse(val).color;
         const hex_col = SvgColor{
             .col = Color_from(parsed, 1.0),
         };
         return hex_col;
+    }
+
+    /// The fragment id of a `url(#id)` (or `url('#id')` / `url("#id")`) paint
+    /// reference, or null when `val` is not one.
+    pub fn parseUrlRef(val: []const u8) ?[]const u8 {
+        if (!std.mem.startsWith(u8, val, "url(")) return null;
+        var inner = val[4..];
+        if (!std.mem.endsWith(u8, inner, ")")) return null;
+        inner = std.mem.trim(u8, inner[0 .. inner.len - 1], " ");
+        // Strip an optional matching quote pair.
+        if (inner.len >= 2 and (inner[0] == '\'' or inner[0] == '"') and inner[inner.len - 1] == inner[0]) {
+            inner = inner[1 .. inner.len - 1];
+        }
+        if (inner.len == 0 or inner[0] != '#') return null;
+        return inner[1..];
     }
     fn normalize_u8(u: u8) f32 {
         const x: f32 = @floatFromInt(u);
