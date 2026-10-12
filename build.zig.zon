@@ -1,12 +1,13 @@
 .{
     .name = .svg2tvg,
     .fingerprint = 0x15ec8a64b919931e,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .version = "0.0.0",
     .dependencies = .{
+        // 0.17-compatible revision (PR #72: ArrayList.last now returns a value).
         .xml = .{
-            .url = "git+https://github.com/ianprime0509/zig-xml#b97f2ab4868ae3cac9902b33a40d3f31d2df739d",
-            .hash = "xml-0.2.0-ZTbP3yI6AgB9Rpd2hQrueO63ib0Bm6mQiL_WB1t7JAmP",
+            .url = "git+https://github.com/flyewic/zig-xml#efae0fcbbedd6ad4130738149f49daa6765fbfd6",
+            .hash = "xml-0.2.0-ZTbP35N4AgCLKY1YU0TFz0pRvLiGWnEWAoO6Ugjk-RRE",
         },
     },
     .paths = .{
